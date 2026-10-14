@@ -23,19 +23,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller
-          if (Test-Path requirements.txt) {
-            python -m pip install -r requirements.txt
-          }
+          python -m pip install pyinstaller tkinterdnd2
 
       - name: Build EXE
-        run: pyinstaller --noconfirm --clean --onefile --name main main.py
+        run: pyinstaller --noconfirm --clean --onefile --collect-all tkinterdnd2 --name main main.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: main-windows-exe
           path: dist/main.exe
+
