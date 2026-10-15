@@ -13,9 +13,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -24,9 +24,9 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
       - name: Build GUI EXE
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name PJSCompressor-PJS4 main.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all tkinterdnd2 --name PJSCompressor-PJS4 main.py
       - name: Upload EXE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: PJSCompressor-PJS4-Windows
           path: dist/PJSCompressor-PJS4.exe
