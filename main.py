@@ -1,12 +1,53 @@
 import os
+import sys
 import json
 import hashlib
 import struct
 import zlib
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from tkinterdnd2 import DND_FILES, TkinterDnD
+import traceback
+from datetime import datetime
+
+# Write diagnostics before importing optional GUI dependencies. This makes startup
+# failures visible even when a double-clicked Windows executable has no console.
+def _diagnostic_log_path():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~") or os.getcwd()
+    return os.path.join(base, "PJSCompressor-diagnostic.log")
+
+DIAGNOSTIC_LOG = _diagnostic_log_path()
+
+def log_diagnostic(message):
+    try:
+        with open(DIAGNOSTIC_LOG, "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+            log_file.flush()
+    except Exception:
+        # Logging must never be the reason the application fails to start.
+        pass
+
+log_diagnostic("\n========== 프로그램 시작 ==========")
+log_diagnostic(f"Python: {sys.version}")
+log_diagnostic(f"Executable: {sys.executable}")
+log_diagnostic(f"Frozen: {getattr(sys, 'frozen', False)}")
+log_diagnostic(f"Working directory: {os.getcwd()}")
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    log_diagnostic("tkinter import 성공")
+except BaseException:
+    log_diagnostic("tkinter import 실패\n" + traceback.format_exc())
+    raise
+
+# Drag-and-drop is optional at startup: if its native Tcl/Tk extension cannot load,
+# the basic file/folder picker GUI should still start.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    log_diagnostic("tkinterdnd2 import 성공")
+except BaseException:
+    DND_FILES = None
+    TkinterDnD = None
+    log_diagnostic("tkinterdnd2 import 실패; 드래그 앤 드롭 없이 시작합니다.\n" + traceback.format_exc())
 
 PJS_MAGIC = b"PJS2"
 PJS_LEGACY_MAGIC = b"PJS1"
@@ -313,10 +354,15 @@ class PJSCompressorApp:
             row=0, column=1, padx=(0, 5), sticky="ew")
         ttk.Button(source_frame, text="폴더 선택", width=12, command=self.browse_folder).grid(
             row=0, column=2, sticky="ew")
-        self.source_entry.drop_target_register(DND_FILES)
-        self.source_entry.dnd_bind("<<Drop>>", self.drop_path)
-        source_frame.drop_target_register(DND_FILES)
-        source_frame.dnd_bind("<<Drop>>", self.drop_path)
+        if DND_FILES is not None and hasattr(self.source_entry, "drop_target_register"):
+            try:
+                self.source_entry.drop_target_register(DND_FILES)
+                self.source_entry.dnd_bind("<<Drop>>", self.drop_path)
+                source_frame.drop_target_register(DND_FILES)
+                source_frame.dnd_bind("<<Drop>>", self.drop_path)
+                log_diagnostic("드래그 앤 드롭 등록 성공")
+            except Exception:
+                log_diagnostic("드래그 앤 드롭 등록 실패\n" + traceback.format_exc())
 
         format_frame = ttk.LabelFrame(outer, text="3. 압축 형식", padding=8)
         format_frame.pack(fill="x", pady=(0, 10))
@@ -553,47 +599,61 @@ class PJSCompressorApp:
 
 
 
+
 def main():
-    log_path = os.path.join(
-        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-        "PJSCompressor-diagnostic.log"
-    )
-
-    def log(message):
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(message + "\n")
-            f.flush()
-
+    root = None
     try:
-        log("\n========== 프로그램 시작 ==========")
-        log("Python 실행 진입")
+        log_diagnostic("GUI 생성 시작")
+        if TkinterDnD is not None:
+            try:
+                root = TkinterDnD.Tk()
+                log_diagnostic("TkinterDnD.Tk() 성공")
+            except BaseException:
+                log_diagnostic("TkinterDnD.Tk() 실패; 기본 Tk로 재시도합니다.\n" + traceback.format_exc())
+                root = tk.Tk()
+                log_diagnostic("tk.Tk() 대체 생성 성공")
+        else:
+            root = tk.Tk()
+            log_diagnostic("tk.Tk() 생성 성공 (드래그 앤 드롭 비활성화)")
 
-        root = TkinterDnD.Tk()
-        log("TkinterDnD.Tk() 성공")
-
-        app = PJSCompressorApp(root)
-        log("PJSCompressorApp(root) 성공")
-
+        PJSCompressorApp(root)
         root.geometry("700x470+100+100")
         root.deiconify()
-        root.state("normal")
         root.update_idletasks()
         root.lift()
-
-        log("창 상태: " + str(root.state()))
-        log("창 표시 가능 여부: " + str(root.winfo_viewable()))
-        log("창 크기: " + str(root.winfo_geometry()))
-
-        root.attributes("-topmost", True)
-        root.after(2000, lambda: root.attributes("-topmost", False))
-
-        log("mainloop 진입 직전")
+        log_diagnostic("창 표시 상태: " + str(root.winfo_viewable()))
+        log_diagnostic("창 크기: " + str(root.winfo_geometry()))
+        log_diagnostic("mainloop 진입")
         root.mainloop()
-        log("mainloop 종료")
-
-    except BaseException as exc:
-        import traceback
-        log("오류 발생:\n" + traceback.format_exc())
+        log_diagnostic("mainloop 정상 종료")
+    except BaseException:
+        details = traceback.format_exc()
+        log_diagnostic("치명적 오류\n" + details)
+        try:
+            if root is not None:
+                messagebox.showerror(
+                    "PJSCompressor 시작 오류",
+                    "프로그램 시작 중 오류가 발생했습니다.\n\n"
+                    f"진단 로그 위치:\n{DIAGNOSTIC_LOG}\n\n{details[-2500:]}",
+                    parent=root,
+                )
+            else:
+                # On Windows, show a native error dialog even if Tk could not start.
+                if sys.platform == "win32":
+                    import ctypes
+                    ctypes.windll.user32.MessageBoxW(
+                        0,
+                        f"프로그램 시작 중 오류가 발생했습니다.\n진단 로그: {DIAGNOSTIC_LOG}\n\n{details[-2500:]}",
+                        "PJSCompressor 시작 오류",
+                        0x10,
+                    )
+        except BaseException:
+            log_diagnostic("오류 대화상자 표시 실패\n" + traceback.format_exc())
+        # For console diagnostic builds, preserve a visible traceback as well.
+        try:
+            print(details, file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
