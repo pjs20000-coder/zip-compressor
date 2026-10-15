@@ -56,11 +56,20 @@ class PJS4Tests(unittest.TestCase):
         with self.assertRaises(PJSAuthenticationError):
             decompress_pjs(encrypted, self.root / "out", PASSWORD)
 
-    def test_short_password_rejected(self):
+    def test_one_character_password_round_trip(self):
+        source = self.root / "sample.txt"
+        source.write_text("one-character password test", encoding="utf-8")
+        encrypted = self.root / "sample.pjs"
+        out = self.root / "out"
+        compress_to_pjs(source, encrypted, "x")
+        decompress_pjs(encrypted, out, "x")
+        self.assertEqual((out / "sample.txt").read_bytes(), source.read_bytes())
+
+    def test_empty_password_rejected(self):
         source = self.root / "sample.txt"
         source.write_text("x", encoding="utf-8")
         with self.assertRaises(ValueError):
-            compress_to_pjs(source, self.root / "sample.pjs", "short")
+            compress_to_pjs(source, self.root / "sample.pjs", "")
 
 if __name__ == "__main__":
     unittest.main()

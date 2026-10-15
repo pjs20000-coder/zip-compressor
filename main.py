@@ -159,9 +159,6 @@ class App:
             if password != self.confirm_password.get():
                 messagebox.showwarning("비밀번호 확인", "두 비밀번호가 일치하지 않습니다.")
                 return
-            if len(password) < 12:
-                messagebox.showwarning("비밀번호가 짧습니다", "최소 12자 이상이 필요합니다. 16자 이상의 고유한 문구를 권장합니다.")
-                return
         if self.mode.get() == "decompress" and Path(output).exists() and any(Path(output).iterdir()):
             if not messagebox.askyesno("폴더 확인", "출력 폴더가 비어 있지 않습니다. 기존 파일은 덮어쓰지 않으며, 충돌 시 작업이 중단될 수 있습니다. 계속하시겠습니까?"):
                 return

@@ -153,8 +153,8 @@ def compress_to_pjs(source_path: str | Path, output_path: str | Path, password: 
     """Compress a file/folder into a password-protected PJS4 file."""
     source = Path(source_path)
     output = Path(output_path)
-    if len(password) < 12:
-        raise ValueError("비밀번호는 최소 12자 이상으로 설정해 주세요. 16자 이상의 고유한 문구를 권장합니다.")
+    if not isinstance(password, str) or not password:
+        raise ValueError("비밀번호를 1자 이상 입력해 주세요.")
     output.parent.mkdir(parents=True, exist_ok=True)
     if source.resolve() == output.resolve():
         raise ValueError("입력 파일과 출력 파일이 같을 수 없습니다.")
