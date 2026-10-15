@@ -551,10 +551,43 @@ class PJSCompressorApp:
         messagebox.showerror("오류", f"작업 중 오류가 발생했습니다:\n{error}")
 
 
+
 def main():
     root = TkinterDnD.Tk()
-    PJSCompressorApp(root)
+
+    app = PJSCompressorApp(root)
+
+    # 창의 위치와 표시 상태를 명시적으로 지정
+    root.geometry("700x470+100+100")
+    root.deiconify()
+    root.state("normal")
+    root.update_idletasks()
+    root.lift()
+
+    # 진단 로그
+    print("[DIAG] Tk 창 생성 완료")
+    print("[DIAG] 창 상태:", root.state())
+    print("[DIAG] 창 표시 가능 여부:", root.winfo_viewable())
+    print("[DIAG] 창 크기:", root.winfo_geometry())
+
+    # 2초 동안 창을 맨 앞으로 유지한 뒤 원래 상태로 복귀
+    root.attributes("-topmost", True)
+    root.after(2000, lambda: root.attributes("-topmost", False))
+
+    root.after(
+        1500,
+        lambda: print(
+            "[DIAG] 1.5초 후:",
+            "state =", root.state(),
+            "viewable =", root.winfo_viewable(),
+            "geometry =", root.winfo_geometry()
+        )
+    )
+
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
