@@ -23,6 +23,7 @@ LOG_PATH = configure_logging()
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    from tkinterdnd2 import DND_FILES, TkinterDnD
     import core
 except BaseException:
     logging.exception('Import/init failed')
@@ -40,6 +41,7 @@ class App:
         self.output = tk.StringVar(value='archive.zip')
         self.status = tk.StringVar(value='준비')
         self._build()
+        self._register_drop_targets(root)
         root.after(100, self._poll)
         logging.info('GUI initialized')
 
@@ -48,7 +50,7 @@ class App:
         mode_box = ttk.LabelFrame(outer, text='1. 작업', padding=10); mode_box.pack(fill='x', pady=(0,10))
         ttk.Radiobutton(mode_box,text='압축',variable=self.mode,value='compress',command=self._mode_changed).pack(side='left',padx=(0,20))
         ttk.Radiobutton(mode_box,text='압축 해제',variable=self.mode,value='extract',command=self._mode_changed).pack(side='left')
-        src_box = ttk.LabelFrame(outer,text='2. 원본 파일 또는 폴더',padding=10); src_box.pack(fill='x',pady=(0,10)); src_box.columnconfigure(0,weight=1)
+        src_box = ttk.LabelFrame(outer,text='2. 원본 파일 또는 폴더 — 여기에 파일을 끌어 놓으세요',padding=10); src_box.pack(fill='x',pady=(0,10)); src_box.columnconfigure(0,weight=1)
         ttk.Entry(src_box,textvariable=self.source).grid(row=0,column=0,sticky='ew',padx=(0,8),ipady=4)
         ttk.Button(src_box,text='파일 선택',command=self._browse_file).grid(row=0,column=1,padx=(0,6))
         ttk.Button(src_box,text='폴더 선택',command=self._browse_folder).grid(row=0,column=2)
@@ -64,6 +66,46 @@ class App:
         self.progress=ttk.Progressbar(outer,maximum=100,mode='determinate'); self.progress.pack(fill='x',pady=(0,12))
         ttk.Label(outer,text='오류 진단 로그: '+str(LOG_PATH),wraplength=710,foreground='#555').pack(anchor='w')
         ttk.Label(outer,text='PJS 형식은 암호화가 아닙니다. 중요한 원본은 별도로 백업하세요.',wraplength=710,foreground='#555').pack(anchor='w',pady=(8,0))
+
+    def _register_drop_targets(self, widget):
+        """Enable file/folder drops across the application window."""
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind('<<Drop>>', self._on_drop)
+        except (AttributeError, tk.TclError):
+            pass
+        for child in widget.winfo_children():
+            self._register_drop_targets(child)
+
+    def _on_drop(self, event):
+        """Accept a file or folder dropped onto the GUI window."""
+        try:
+            paths = [p for p in self.root.tk.splitlist(event.data) if p]
+        except (tk.TclError, TypeError):
+            paths = []
+        if not paths:
+            self.status.set('드롭한 경로를 읽을 수 없습니다.')
+            return 'break'
+
+        path = os.path.abspath(os.path.expanduser(paths[0].strip().strip('"')))
+        if not os.path.exists(path):
+            messagebox.showerror('드래그 앤 드롭', f'파일 또는 폴더를 찾을 수 없습니다.\n{path}')
+            return 'break'
+
+        self.source.set(path)
+        suffix = Path(path).suffix.lower()
+        if os.path.isfile(path) and suffix in ('.zip', '.pjs'):
+            self.mode.set('extract')
+            self.format.set(suffix[1:])
+            self.status.set('압축 파일을 받았습니다. 압축 해제 모드로 설정했습니다.')
+        else:
+            self.mode.set('compress')
+            self.status.set('원본을 받았습니다. 압축 모드로 설정했습니다.')
+        self._mode_changed()
+        if len(paths) > 1:
+            self.status.set('여러 항목 중 첫 번째 항목을 선택했습니다. 한 번에 하나씩 처리해 주세요.')
+        logging.info('drag-and-drop source=%s items=%d', path, len(paths))
+        return 'break'
 
     def _mode_changed(self):
         if self.mode.get()=='compress':
@@ -211,7 +253,7 @@ def main():
     logging.info('enter main')
     if not acquire_single_instance():
         return
-    root=tk.Tk()
+    root=TkinterDnD.Tk()
     App(root)
     logging.info('enter mainloop')
     root.mainloop()

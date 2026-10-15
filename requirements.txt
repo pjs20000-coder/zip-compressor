@@ -1,1 +1,2 @@
-# Runtime uses only Python standard library. PyInstaller is installed in GitHub Actions.
+# GUI drag-and-drop support
+tkinterdnd2>=0.4.2
