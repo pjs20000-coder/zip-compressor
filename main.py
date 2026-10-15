@@ -1,270 +1,159 @@
-"""Fresh PJSCompressor GUI using only Python's standard library."""
 from __future__ import annotations
-import os, sys, traceback, logging, threading, queue, ctypes, tempfile
+
+import queue
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
-APP_NAME = 'PJSCompressor'
+from core import compress_to_pjs, decompress_pjs
 
-def configure_logging():
-    base = os.environ.get('LOCALAPPDATA') or str(Path.home())
-    log_dir = Path(base) / APP_NAME
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / 'diagnostic.log'
-    except Exception:
-        log_file = Path.cwd() / 'PJSCompressor-diagnostic.log'
-    logging.basicConfig(filename=str(log_file), level=logging.INFO,
-                        format='%(asctime)s %(levelname)s %(message)s', encoding='utf-8')
-    logging.info('=== startup === Python=%s frozen=%s exe=%s', sys.version, getattr(sys,'frozen',False), sys.executable)
-    return log_file
-
-LOG_PATH = configure_logging()
-
-try:
-    import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    import core
-except BaseException:
-    logging.exception('Import/init failed')
-    raise
+APP_TITLE = "PJSCompressor PJS4 — 비밀번호 보호"
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        root.title('PJSCompressor — PJS / ZIP 압축 관리자')
-        root.geometry('760x520'); root.minsize(680,470)
-        self.events = queue.Queue(); self.busy = False
-        self.mode = tk.StringVar(value='compress')
-        self.format = tk.StringVar(value='zip')
-        self.source = tk.StringVar()
-        self.output = tk.StringVar(value='archive.zip')
-        self.status = tk.StringVar(value='준비')
+        self.root.title(APP_TITLE)
+        self.root.geometry("690x410")
+        self.root.minsize(620, 380)
+        self.mode = tk.StringVar(value="compress")
+        self.input_path = tk.StringVar()
+        self.output_path = tk.StringVar()
+        self.password = tk.StringVar()
+        self.confirm_password = tk.StringVar()
+        self.status = tk.StringVar(value="파일 또는 폴더를 선택해 주세요.")
+        self.events: queue.Queue = queue.Queue()
         self._build()
-        self._register_drop_targets(root)
-        root.after(100, self._poll)
-        logging.info('GUI initialized')
+        self.root.after(100, self._poll_events)
 
     def _build(self):
-        outer = ttk.Frame(self.root, padding=16); outer.pack(fill='both', expand=True)
-        mode_box = ttk.LabelFrame(outer, text='1. 작업', padding=10); mode_box.pack(fill='x', pady=(0,10))
-        ttk.Radiobutton(mode_box,text='압축',variable=self.mode,value='compress',command=self._mode_changed).pack(side='left',padx=(0,20))
-        ttk.Radiobutton(mode_box,text='압축 해제',variable=self.mode,value='extract',command=self._mode_changed).pack(side='left')
-        src_box = ttk.LabelFrame(outer,text='2. 원본 파일 또는 폴더 — 여기에 파일을 끌어 놓으세요',padding=10); src_box.pack(fill='x',pady=(0,10)); src_box.columnconfigure(0,weight=1)
-        ttk.Entry(src_box,textvariable=self.source).grid(row=0,column=0,sticky='ew',padx=(0,8),ipady=4)
-        ttk.Button(src_box,text='파일 선택',command=self._browse_file).grid(row=0,column=1,padx=(0,6))
-        ttk.Button(src_box,text='폴더 선택',command=self._browse_folder).grid(row=0,column=2)
-        fmt_box=ttk.LabelFrame(outer,text='3. 형식',padding=10); fmt_box.pack(fill='x',pady=(0,10))
-        ttk.Radiobutton(fmt_box,text='ZIP — 일반 호환',variable=self.format,value='zip',command=self._format_changed).pack(side='left',padx=(0,20))
-        ttk.Radiobutton(fmt_box,text='PJS — 전용 무손실 형식',variable=self.format,value='pjs',command=self._format_changed).pack(side='left')
-        out_box=ttk.LabelFrame(outer,text='4. 저장 파일명 또는 압축 해제 폴더',padding=10); out_box.pack(fill='x',pady=(0,12)); out_box.columnconfigure(0,weight=1)
-        ttk.Entry(out_box,textvariable=self.output).grid(row=0,column=0,sticky='ew',padx=(0,8),ipady=4)
-        ttk.Button(out_box,text='위치 선택',command=self._choose_output).grid(row=0,column=1)
-        bottom=ttk.Frame(outer); bottom.pack(fill='x',pady=(0,8))
-        ttk.Label(bottom,textvariable=self.status).pack(side='left',fill='x',expand=True)
-        self.run_btn=ttk.Button(bottom,text='압축 실행',command=self._start); self.run_btn.pack(side='right')
-        self.progress=ttk.Progressbar(outer,maximum=100,mode='determinate'); self.progress.pack(fill='x',pady=(0,12))
-        ttk.Label(outer,text='오류 진단 로그: '+str(LOG_PATH),wraplength=710,foreground='#555').pack(anchor='w')
-        ttk.Label(outer,text='PJS 형식은 암호화가 아닙니다. 중요한 원본은 별도로 백업하세요.',wraplength=710,foreground='#555').pack(anchor='w',pady=(8,0))
-
-    def _register_drop_targets(self, widget):
-        """Enable file/folder drops across the application window."""
-        try:
-            widget.drop_target_register(DND_FILES)
-            widget.dnd_bind('<<Drop>>', self._on_drop)
-        except (AttributeError, tk.TclError):
-            pass
-        for child in widget.winfo_children():
-            self._register_drop_targets(child)
-
-    def _on_drop(self, event):
-        """Accept a file or folder dropped onto the GUI window."""
-        try:
-            paths = [p for p in self.root.tk.splitlist(event.data) if p]
-        except (tk.TclError, TypeError):
-            paths = []
-        if not paths:
-            self.status.set('드롭한 경로를 읽을 수 없습니다.')
-            return 'break'
-
-        path = os.path.abspath(os.path.expanduser(paths[0].strip().strip('"')))
-        if not os.path.exists(path):
-            messagebox.showerror('드래그 앤 드롭', f'파일 또는 폴더를 찾을 수 없습니다.\n{path}')
-            return 'break'
-
-        self.source.set(path)
-        suffix = Path(path).suffix.lower()
-        if os.path.isfile(path) and suffix in ('.zip', '.pjs'):
-            self.mode.set('extract')
-            self.format.set(suffix[1:])
-            self.status.set('압축 파일을 받았습니다. 압축 해제 모드로 설정했습니다.')
-        else:
-            self.mode.set('compress')
-            self.status.set('원본을 받았습니다. 압축 모드로 설정했습니다.')
+        frame = ttk.Frame(self.root, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="PJSCompressor PJS4", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 5))
+        ttk.Label(frame, text="비밀번호 기반 암호화 · 기존 PJS1/PJS2/PJS3와 호환되지 않는 새 형식", foreground="#555555").grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
+        mode_frame = ttk.Frame(frame)
+        mode_frame.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        ttk.Radiobutton(mode_frame, text="압축 + 암호화", value="compress", variable=self.mode, command=self._mode_changed).pack(side="left", padx=(0, 18))
+        ttk.Radiobutton(mode_frame, text="복호화 + 압축 해제", value="decompress", variable=self.mode, command=self._mode_changed).pack(side="left")
+        ttk.Label(frame, text="입력 파일 / 폴더").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.input_path).grid(row=3, column=1, sticky="ew", padx=8, pady=5)
+        self.input_file_btn = ttk.Button(frame, text="파일 선택", command=self._choose_input_file)
+        self.input_file_btn.grid(row=3, column=2, sticky="ew", pady=5)
+        self.input_folder_btn = ttk.Button(frame, text="폴더 선택", command=self._choose_input_folder)
+        self.input_folder_btn.grid(row=4, column=2, sticky="ew", pady=5)
+        ttk.Label(frame, text="출력 위치").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.output_path).grid(row=5, column=1, sticky="ew", padx=8, pady=5)
+        self.output_btn = ttk.Button(frame, text="저장 위치 선택", command=self._choose_output)
+        self.output_btn.grid(row=5, column=2, sticky="ew", pady=5)
+        ttk.Label(frame, text="비밀번호").grid(row=6, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.password, show="*").grid(row=6, column=1, columnspan=2, sticky="ew", padx=8, pady=5)
+        self.confirm_label = ttk.Label(frame, text="비밀번호 확인")
+        self.confirm_label.grid(row=7, column=0, sticky="w", pady=5)
+        self.confirm_entry = ttk.Entry(frame, textvariable=self.confirm_password, show="*")
+        self.confirm_entry.grid(row=7, column=1, columnspan=2, sticky="ew", padx=8, pady=5)
+        ttk.Label(frame, text="권장: 16자 이상의 고유한 비밀번호. 분실하면 복원할 수 없습니다.", foreground="#8a3b12").grid(row=8, column=0, columnspan=3, sticky="w", pady=(5, 10))
+        self.run_btn = ttk.Button(frame, text="압축 및 암호화", command=self._run)
+        self.run_btn.grid(row=9, column=0, sticky="ew", pady=(2, 10))
+        ttk.Label(frame, textvariable=self.status, wraplength=600).grid(row=10, column=0, columnspan=3, sticky="w", pady=5)
+        frame.columnconfigure(1, weight=1)
         self._mode_changed()
-        if len(paths) > 1:
-            self.status.set('여러 항목 중 첫 번째 항목을 선택했습니다. 한 번에 하나씩 처리해 주세요.')
-        logging.info('drag-and-drop source=%s items=%d', path, len(paths))
-        return 'break'
 
     def _mode_changed(self):
-        if self.mode.get()=='compress':
-            self.run_btn.configure(text='압축 실행')
+        compressing = self.mode.get() == "compress"
+        self.run_btn.configure(text="압축 및 암호화" if compressing else "복호화 및 압축 해제")
+        if compressing:
+            self.confirm_label.grid()
+            self.confirm_entry.grid()
+            self.input_folder_btn.configure(state="normal")
         else:
-            self.run_btn.configure(text='압축 해제')
-        self._suggest_output()
+            self.confirm_label.grid_remove()
+            self.confirm_entry.grid_remove()
+            self.input_folder_btn.configure(state="disabled")
+        self.output_path.set("")
+        self.status.set("압축할 파일/폴더를 선택해 주세요." if compressing else "복원할 PJS4 파일을 선택해 주세요.")
 
-    def _format_changed(self): self._suggest_output()
-
-    def _suggest_output(self):
-        src=self.source.get().strip().strip('"')
-        if not src: return
-        if self.mode.get()=='compress':
-            ext='.pjs' if self.format.get()=='pjs' else '.zip'
-            base=os.path.basename(os.path.normpath(src))
-            if os.path.isfile(src): base=os.path.splitext(base)[0]
-            self.output.set(base+ext)
+    def _choose_input_file(self):
+        if self.mode.get() == "decompress":
+            path = filedialog.askopenfilename(title="PJS4 파일 선택", filetypes=[("PJS4 files", "*.pjs"), ("All files", "*.*")])
         else:
-            self.output.set(os.path.splitext(src)[0]+'_압축해제')
+            path = filedialog.askopenfilename(title="압축할 파일 선택")
+        if path:
+            self.input_path.set(path)
+            if self.mode.get() == "compress":
+                p = Path(path)
+                self.output_path.set(str(p.with_name(p.name + ".pjs")))
+            else:
+                self.output_path.set(str(Path(path).with_suffix("")))
 
-    def _browse_file(self):
-        if self.mode.get()=='extract':
-            path=filedialog.askopenfilename(title='압축 파일 선택',filetypes=[('압축 파일','*.zip *.pjs'),('모든 파일','*.*')])
-        else: path=filedialog.askopenfilename(title='압축할 파일 선택')
-        if path: self.source.set(path); self._suggest_output()
-
-    def _browse_folder(self):
-        if self.mode.get()=='extract':
-            messagebox.showinfo('안내','압축 해제할 파일을 선택해 주세요.'); return
-        path=filedialog.askdirectory(title='압축할 폴더 선택')
-        if path: self.source.set(path); self._suggest_output()
+    def _choose_input_folder(self):
+        path = filedialog.askdirectory(title="압축할 폴더 선택")
+        if path:
+            self.input_path.set(path)
+            p = Path(path)
+            self.output_path.set(str(p.with_name(p.name + ".pjs")))
 
     def _choose_output(self):
-        if self.mode.get()=='extract':
-            path=filedialog.askdirectory(title='압축 해제 폴더 선택')
+        if self.mode.get() == "compress":
+            path = filedialog.asksaveasfilename(title="PJS4 저장 위치", defaultextension=".pjs", filetypes=[("PJS4 files", "*.pjs")])
         else:
-            ext='.pjs' if self.format.get()=='pjs' else '.zip'
-            path=filedialog.asksaveasfilename(title='압축 파일 저장 위치',defaultextension=ext,initialfile=os.path.basename(self.output.get() or 'archive'+ext),filetypes=[('PJS 파일','*.pjs'),('ZIP 파일','*.zip'),('모든 파일','*.*')])
-        if path: self.output.set(path)
+            path = filedialog.askdirectory(title="압축 해제 폴더 선택")
+        if path:
+            self.output_path.set(path)
 
-    def _start(self):
-        if self.busy: return
-        source=os.path.abspath(os.path.expanduser(self.source.get().strip().strip('"')))
-        output=os.path.expanduser(self.output.get().strip().strip('"'))
-        if not source or not os.path.exists(source): messagebox.showerror('입력 확인','유효한 원본 파일 또는 폴더를 선택해 주세요.'); return
-        if not output: messagebox.showerror('입력 확인','출력 경로를 입력해 주세요.'); return
-        mode=self.mode.get(); fmt=self.format.get()
-        if mode=='compress':
-            ext='.pjs' if fmt=='pjs' else '.zip'
-            if not output.lower().endswith(ext): output+=ext
-            output=os.path.abspath(output)
-            if os.path.normcase(os.path.abspath(source)) == os.path.normcase(output):
-                messagebox.showerror('경로 확인', '원본 파일과 출력 파일이 같습니다. 다른 저장 경로를 선택해 주세요.')
+    def _run(self):
+        source = self.input_path.get().strip()
+        output = self.output_path.get().strip()
+        password = self.password.get()
+        if not source or not output:
+            messagebox.showwarning("입력 필요", "입력 파일/폴더와 출력 위치를 선택해 주세요.")
+            return
+        if not password:
+            messagebox.showwarning("비밀번호 필요", "비밀번호를 입력해 주세요.")
+            return
+        if self.mode.get() == "compress":
+            if password != self.confirm_password.get():
+                messagebox.showwarning("비밀번호 확인", "두 비밀번호가 일치하지 않습니다.")
                 return
-            if os.path.isdir(source):
-                try:
-                    if os.path.commonpath([source,output])==source: messagebox.showerror('경로 확인','압축 결과를 원본 폴더 내부에 저장할 수 없습니다.'); return
-                except ValueError: pass
-            if not os.path.isdir(os.path.dirname(output)): messagebox.showerror('경로 확인','출력 폴더가 존재하지 않습니다.'); return
-            if os.path.exists(output) and not messagebox.askyesno('덮어쓰기 확인',f'파일이 이미 있습니다. 덮어쓰시겠습니까?\n{output}'): return
-        else:
-            if not os.path.isfile(source): messagebox.showerror('입력 확인','압축 해제할 ZIP 또는 PJS 파일을 선택해 주세요.'); return
-            ext=os.path.splitext(source)[1].lower()
-            if ext not in ('.zip','.pjs'): messagebox.showerror('형식 확인','파일 확장자가 .zip 또는 .pjs인지 확인해 주세요.'); return
-            fmt=ext[1:]; output=os.path.abspath(output)
-            if os.path.exists(output) and os.listdir(output) and not messagebox.askyesno('폴더 확인','대상 폴더가 비어 있지 않습니다. 계속하시겠습니까?'): return
-        self.busy=True; self.run_btn.configure(state='disabled'); self.progress['value']=0; self.status.set('작업 준비 중…')
-        logging.info('start mode=%s format=%s source=%s output=%s',mode,fmt,source,output)
-        threading.Thread(target=self._worker,args=(mode,fmt,source,output),daemon=True).start()
+            if len(password) < 12:
+                messagebox.showwarning("비밀번호가 짧습니다", "최소 12자 이상이 필요합니다. 16자 이상의 고유한 문구를 권장합니다.")
+                return
+        if self.mode.get() == "decompress" and Path(output).exists() and any(Path(output).iterdir()):
+            if not messagebox.askyesno("폴더 확인", "출력 폴더가 비어 있지 않습니다. 기존 파일은 덮어쓰지 않으며, 충돌 시 작업이 중단될 수 있습니다. 계속하시겠습니까?"):
+                return
+        self.run_btn.configure(state="disabled")
+        self.status.set("작업 중입니다. 큰 파일은 시간이 걸릴 수 있습니다.")
+        action = self.mode.get()
+        threading.Thread(target=self._worker, args=(action, source, output, password), daemon=True).start()
 
-    def _worker(self,mode,fmt,source,output):
+    def _worker(self, action, source, output, password):
         try:
-            def progress(pct,cur,total): self.events.put(('progress',pct,cur,total))
-            if mode=='compress':
-                (core.create_pjs if fmt=='pjs' else core.create_zip)(source,output,progress)
-                self.events.put(('done',f'압축이 완료되었습니다.\n\n저장 위치:\n{output}'))
+            if action == "compress":
+                result = compress_to_pjs(source, output, password)
+                self.events.put((True, f"암호화 완료: {result}"))
             else:
-                os.makedirs(output,exist_ok=True)
-                (core.extract_pjs if fmt=='pjs' else core.extract_zip)(source,output,progress)
-                self.events.put(('done',f'압축 해제가 완료되었습니다.\n\n저장 위치:\n{output}'))
-        except BaseException as exc:
-            logging.exception('operation failed')
-            self.events.put(('error',str(exc),traceback.format_exc()))
+                result = decompress_pjs(source, output, password)
+                self.events.put((True, f"복원 완료: {result}"))
+        except Exception as exc:
+            self.events.put((False, str(exc)))
 
-    def _poll(self):
+    def _poll_events(self):
         try:
             while True:
-                event=self.events.get_nowait(); kind=event[0]
-                if kind=='progress':
-                    _,pct,cur,total=event
-                    self.progress['value']=pct
-                    if total > 1:
-                        self.status.set(f'작업 중… {pct}% ({cur / (1024*1024):.1f}/{total / (1024*1024):.1f} MB)')
-                    else:
-                        self.status.set(f'작업 중… {pct}%')
-                elif kind=='done':
-                    self.busy=False; self.run_btn.configure(state='normal'); self.progress['value']=100; self.status.set('완료'); messagebox.showinfo('완료',event[1])
-                elif kind=='error':
-                    self.busy=False; self.run_btn.configure(state='normal'); self.status.set('오류 발생'); messagebox.showerror('작업 오류',event[1]+'\n\n진단 로그에 상세 내용이 기록되었습니다.')
-        except queue.Empty: pass
-        self.root.after(100,self._poll)
-
-
-_INSTANCE_HANDLE = None
-_INSTANCE_LOCK_FILE = None
-
-
-def acquire_single_instance() -> bool:
-    """Allow only one running copy per Windows logon session."""
-    global _INSTANCE_HANDLE, _INSTANCE_LOCK_FILE
-    if os.name == 'nt':
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-        kernel32.CreateMutexW.restype = ctypes.c_void_p
-        handle = kernel32.CreateMutexW(None, False, 'Local\\PJSCompressor_SingleInstance')
-        if not handle:
-            logging.error('CreateMutexW failed: %s', ctypes.get_last_error())
-            return True  # Do not block app startup if the OS lock itself fails.
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-            kernel32.CloseHandle(handle)
-            ctypes.windll.user32.MessageBoxW(None, 'PJSCompressor가 이미 실행 중입니다.', 'PJSCompressor', 0x40)
-            return False
-        _INSTANCE_HANDLE = handle  # Keep the handle alive for the lifetime of the app.
-        return True
-
-    # Portable fallback for source runs on POSIX.
-    try:
-        import fcntl
-        lock_path = os.path.join(tempfile.gettempdir(), 'PJSCompressor-single-instance.lock')
-        lock_file = open(lock_path, 'w')
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_file.close()
-            return False
-        _INSTANCE_LOCK_FILE = lock_file
-        return True
-    except Exception:
-        logging.exception('Single-instance lock could not be created')
-        return True
-
+                success, message = self.events.get_nowait()
+                self.run_btn.configure(state="normal")
+                self.status.set(message)
+                if success:
+                    messagebox.showinfo("완료", message)
+                else:
+                    messagebox.showerror("작업 실패", message)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_events)
 
 def main():
-    logging.info('enter main')
-    if not acquire_single_instance():
-        return
-    root=TkinterDnD.Tk()
+    root = tk.Tk()
     App(root)
-    logging.info('enter mainloop')
     root.mainloop()
-    logging.info('mainloop ended')
 
-if __name__=='__main__':
-    try: main()
-    except BaseException:
-        logging.exception('fatal startup error')
-        try:
-            import tkinter.messagebox as mb
-            mb.showerror('PJSCompressor 시작 오류',f'프로그램을 시작하지 못했습니다.\n진단 로그: {LOG_PATH}')
-        except BaseException: pass
-        raise
+if __name__ == "__main__":
+    main()

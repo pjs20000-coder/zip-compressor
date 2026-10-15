@@ -1,36 +1,44 @@
-# PJSCompressor — Fresh Rebuild
-
-새로 구성한 PJS/ZIP 압축 관리 프로그램입니다. 기존 `tkinterdnd2` 외부 의존성을 제거하고 Python 표준 라이브러리만으로 GUI와 압축 처리를 구성했습니다.
+# PJSCompressor PJS4 — 비밀번호 암호화 프로토타입
 
 ## 포함 기능
-- 파일 또는 폴더를 ZIP으로 압축
-- 파일 또는 폴더를 PJS2로 압축
-- ZIP/PJS 파일 압축 해제
-- 진행률 표시 및 오류 진단 로그
-- ZIP/PJS 압축 해제 경로 탐색 방지
-- 기존 PJS1 읽기 및 PJS2 형식 호환 로직 유지
 
-## 로컬 실행
-Python 3.10 이상 권장.
+- 파일 또는 폴더를 ZIP으로 압축한 뒤 PJS4로 암호화
+- PJS4 파일을 비밀번호로 복호화하고 안전하게 압축 해제
+- Argon2id(128 MiB, 3회 반복, 병렬도 2)로 비밀번호에서 키 유도
+- AES-256-GCM 인증 암호화
+- 1 MiB 단위 청크 암호화로 대용량 파일의 전체 메모리 적재 방지
+- 암호문 변조 검출, 잘못된 비밀번호 처리
+- ZIP 경로 탈출, 심볼릭 링크, 중복 경로에 대한 기본 방어
+- GitHub Actions Windows EXE 빌드
 
-```bash
+## 주의: PJS3와 호환되지 않습니다
+
+이 프로토타입은 새 `PJS4` 포맷입니다. 기존 `PJS1`, `PJS2`, `PJS3` 파일을 읽거나 기존 앱의 모든 기능을 대체하지 않습니다. 실제 기존 프로젝트에 적용할 때는 기존 형식을 유지한 채 PJS4를 추가하고, GUI의 형식 판별과 복원 분기를 별도로 연결해야 합니다.
+
+## 실행
+
+Python 3.10 이상 권장:
+
+```powershell
+python -m pip install -r requirements.txt
 python main.py
+```
+
+## 테스트
+
+```powershell
 python -m unittest discover -s tests -v
 ```
 
-## GitHub Actions
-프로젝트를 저장소 루트에 복사하고 `main` 브랜치에 push하거나 Actions에서 `Build PJSCompressor Windows`를 수동 실행하세요. 테스트 통과 후 두 아티팩트가 생성됩니다.
+## Windows EXE 빌드
 
-- `PJSCompressor-Diagnostic-Windows`: 콘솔이 있는 진단용 실행 파일
-- `PJSCompressor-GUI-Windows`: 콘솔 없는 GUI 실행 파일
+GitHub 저장소의 `main` 브랜치에 파일을 올린 뒤 Actions에서 `Build PJSCompressor PJS4 Windows`를 실행합니다. 결과물은 `PJSCompressor-PJS4-Windows` 아티팩트로 제공됩니다.
 
-## 진단 로그
-Windows에서 `%LOCALAPPDATA%\PJSCompressor\diagnostic.log`에 기록합니다. 시작 직후 실패해도 GUI 초기화 이전 단계부터 로그 기록을 시도합니다.
+## 보안상 중요한 점
 
-## 중요
-PJS 파일은 전용 형식이며 암호화가 아닙니다. 새로 생성하는 PJS 파일은 PJS3 형식입니다. 이 프로그램은 기존 PJS1/PJS2 파일도 읽을 수 있지만, 구버전의 다른 프로그램이 PJS3를 지원한다고 보장할 수 없습니다. PJS는 암호화가 아닙니다. 실제 사용자 파일에 적용하기 전에는 복사본으로 검증하세요.
-
-
-## 드래그 앤 드롭
-
-프로그램 창 안으로 파일 또는 폴더를 끌어 놓으면 원본 경로가 자동으로 입력됩니다. `.zip` 또는 `.pjs` 파일을 놓으면 압축 해제 모드로 자동 전환합니다. 여러 항목을 한 번에 놓으면 첫 번째 항목만 선택되므로 나머지는 개별적으로 놓아 주세요. EXE 아이콘 위에 파일을 놓아 실행하는 방식은 지원하지 않습니다.
+- 비밀번호는 최소 12자로 제한하지만, 16자 이상의 고유한 문구를 권장합니다.
+- 비밀번호를 잊으면 복구할 수 없습니다. 비밀번호 관리 및 백업 절차를 별도로 마련하세요.
+- 이 코드는 검증된 라이브러리를 사용하지만, 전문 보안 감사 또는 침투 테스트를 받은 제품은 아닙니다.
+- PJS4는 비밀번호를 모르는 사람이 파일을 단순히 zlib 해제해서 원본을 얻지 못하게 하는 설계입니다. 다만 비밀번호가 약하면 오프라인 추측 공격을 받을 수 있습니다.
+- EXE를 배포하기 전 실제 Windows 환경에서 테스트하고, 보안 경고가 나타나면 우회하지 말고 파일과 빌드 과정을 검사하세요.
+- 현재 형식은 암호화된 데이터의 파일명/메타데이터를 숨기지만, 외부 PJS 파일 크기와 PJS4 시그니처 등 일부 정보는 노출됩니다.

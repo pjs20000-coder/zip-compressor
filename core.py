@@ -1,394 +1,250 @@
-"""PJS/ZIP processing core. PJS format logic retained for compatibility."""
+"""Password-protected PJS4 format.
+
+PJS4 uses Argon2id to derive a key from the user's password and AES-256-GCM
+for authenticated encryption. The archive filename and metadata are inside the
+encrypted ZIP payload. PJS4 is a new format and is not compatible with PJS1-3.
+"""
 from __future__ import annotations
-import hashlib
+
 import os
-import struct
-import zlib
-import zipfile
-import tempfile
 import shutil
-from pathlib import Path
-from typing import Callable, Iterable
+import stat
+import struct
+import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
 
-PJS_MAGIC = b"PJS2"
-PJS_LEGACY_MAGIC = b"PJS1"
-PJS3_MAGIC = b"PJS3"
-PJS_VERSION = 2
-PJS3_VERSION = 3
-PJS_BLOCK_SIZE = 4096
-MAX_WINDOW = 65535
-MAX_MATCH = 258
-MIN_MATCH = 3
-MAX_CANDIDATES = 64
-Progress = Callable[[int, int, int], None]
+from argon2.low_level import Type, hash_secret_raw
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+MAGIC = b"PJS4"
+VERSION = 1
+SALT_SIZE = 16
+NONCE_PREFIX_SIZE = 8
+KEY_SIZE = 32
+TAG_SIZE = 16
+CHUNK_SIZE = 1024 * 1024  # 1 MiB
+# Fixed, authenticated format parameters. Do not accept attacker-controlled KDF costs.
+ARGON2_TIME_COST = 3
+ARGON2_MEMORY_KIB = 131072  # 128 MiB
+ARGON2_PARALLELISM = 2
+# magic, version, salt, nonce prefix, chunk size
+HEADER_STRUCT = struct.Struct(">4sB16s8sI")
+RECORD_STRUCT = struct.Struct(">BI")  # final flag, ciphertext length
+MAX_ARCHIVE_TOTAL_SIZE = 1 << 40  # safety cap: 1 TiB of extracted data
 
-def pjs_compress(data: bytes, seed: int = 0) -> bytes:
-    out = bytearray(); positions: dict[bytes, list[int]] = {}; i = 0; n = len(data)
-    def add_position(pos: int) -> None:
-        if pos + 1 >= n: return
-        bucket = positions.setdefault(data[pos:pos+2], []); bucket.append(pos)
-        while bucket and (pos - bucket[0] > MAX_WINDOW or len(bucket) > 256): bucket.pop(0)
-    while i < n:
-        control_pos = len(out); out.append(0); control = 0
-        for bit_index in range(8):
-            if i >= n: break
-            best_len = best_offset = 0
-            if i + MIN_MATCH <= n:
-                candidates = positions.get(data[i:i+2], [])
-                ordered = list(reversed(candidates))
-                if ordered:
-                    rotate = seed % len(ordered); ordered = ordered[rotate:] + ordered[:rotate]
-                checked = 0
-                for candidate in ordered:
-                    offset = i - candidate
-                    if offset <= 0: continue
-                    if offset > MAX_WINDOW: break
-                    checked += 1
-                    if checked > MAX_CANDIDATES: break
-                    limit = min(MAX_MATCH, n-i); length = 2
-                    while length < limit and data[candidate+length] == data[i+length]: length += 1
-                    if length >= MIN_MATCH and length > best_len:
-                        best_len, best_offset = length, offset
-                        if length == limit: break
-            if best_len >= MIN_MATCH:
-                out.extend(struct.pack('<HB', best_offset, best_len-MIN_MATCH))
-                end = i + best_len
-                while i < end: add_position(i); i += 1
-            else:
-                control |= 1 << bit_index; out.append(data[i]); add_position(i); i += 1
-        out[control_pos] = control
-    return bytes(out)
+class PJSFormatError(ValueError):
+    """Invalid, damaged, or unsupported PJS4 file."""
 
+class PJSAuthenticationError(ValueError):
+    """Password is wrong or encrypted data has been altered."""
 
-def pjs_decompress(data: bytes, expected_size: int) -> bytes:
-    out = bytearray(); i = 0
-    while i < len(data):
-        control = data[i]; i += 1
-        for bit_index in range(8):
-            if i >= len(data): break
-            if control & (1 << bit_index): out.append(data[i]); i += 1
-            else:
-                if i + 3 > len(data): raise ValueError('PJS 데이터가 손상되었습니다(압축 토큰이 잘림).')
-                offset, code = struct.unpack_from('<HB', data, i); i += 3; length = code + MIN_MATCH
-                if offset == 0 or offset > len(out): raise ValueError('PJS 데이터가 손상되었습니다(잘못된 참조 위치).')
-                for _ in range(length): out.append(out[-offset])
-            if len(out) > expected_size: raise ValueError('PJS 데이터가 헤더에 기록된 원본 크기를 초과합니다.')
-    if len(out) != expected_size:
-        raise ValueError(f'원본 크기가 일치하지 않습니다. 예상: {expected_size}바이트, 복원: {len(out)}바이트')
-    return bytes(out)
+def _derive_key(password: str, salt: bytes) -> bytes:
+    if not isinstance(password, str) or not password:
+        raise ValueError("비밀번호를 입력해 주세요.")
+    return hash_secret_raw(
+        secret=password.encode("utf-8"), salt=salt,
+        time_cost=ARGON2_TIME_COST, memory_cost=ARGON2_MEMORY_KIB,
+        parallelism=ARGON2_PARALLELISM, hash_len=KEY_SIZE,
+        type=Type.ID, version=19,
+    )
 
+def _read_exact(fileobj, size: int) -> bytes:
+    parts = bytearray()
+    while len(parts) < size:
+        block = fileobj.read(size - len(parts))
+        if not block:
+            raise PJSFormatError("PJS 파일이 잘렸거나 손상되었습니다.")
+        parts.extend(block)
+    return bytes(parts)
 
-def filename_seed(name: str) -> int:
-    normalized = name.replace('\\', '/').encode('utf-8', errors='strict')
-    return int.from_bytes(hashlib.blake2s(normalized, digest_size=4, person=b'PJSname').digest(), 'little')
+def _make_zip(source: Path, zip_path: Path) -> None:
+    source = source.resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"입력 경로를 찾을 수 없습니다: {source}")
+    if source.is_symlink():
+        raise ValueError("심볼릭 링크는 입력으로 지원하지 않습니다.")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+        if source.is_file():
+            zf.write(source, arcname=source.name)
+            return
+        if not source.is_dir():
+            raise ValueError("일반 파일 또는 폴더만 압축할 수 있습니다.")
+        base = source.parent
+        # Store the root folder and empty directories as well as files.
+        for item in sorted(source.rglob("*")):
+            if item.is_symlink():
+                raise ValueError(f"심볼릭 링크는 압축할 수 없습니다: {item}")
+            arcname = item.relative_to(base).as_posix()
+            if item.is_dir():
+                zf.writestr(arcname.rstrip("/") + "/", b"")
+            elif item.is_file():
+                zf.write(item, arcname=arcname)
 
+def _encrypt_stream(source, destination, password: str) -> None:
+    salt = os.urandom(SALT_SIZE)
+    nonce_prefix = os.urandom(NONCE_PREFIX_SIZE)
+    header = HEADER_STRUCT.pack(MAGIC, VERSION, salt, nonce_prefix, CHUNK_SIZE)
+    key = _derive_key(password, salt)
+    aes = AESGCM(key)
+    destination.write(header)
+    index = 0
+    current = source.read(CHUNK_SIZE)
+    following = source.read(CHUNK_SIZE)
+    while True:
+        final = not following
+        flag = 1 if final else 0
+        if index >= 0xFFFFFFFF:
+            raise ValueError("파일이 너무 커서 PJS4 청크 제한을 초과했습니다.")
+        nonce = nonce_prefix + index.to_bytes(4, "big")
+        aad = header + index.to_bytes(8, "big") + bytes([flag]) + len(current).to_bytes(4, "big")
+        ciphertext = aes.encrypt(nonce, current, aad)
+        destination.write(RECORD_STRUCT.pack(flag, len(ciphertext)))
+        destination.write(ciphertext)
+        index += 1
+        if final:
+            break
+        current, following = following, source.read(CHUNK_SIZE)
 
-def transform_payload(data: bytes, name: str) -> bytes:
-    name_bytes = name.replace('\\', '/').encode('utf-8', errors='strict'); out = bytearray(len(data))
-    for block_index, start in enumerate(range(0, len(data), PJS_BLOCK_SIZE)):
-        chunk = data[start:start+PJS_BLOCK_SIZE]; stream = bytearray(); counter = 0
-        while len(stream) < len(chunk):
-            material = (b'PJS2-scramble\0' + len(name_bytes).to_bytes(4,'little') + name_bytes +
-                        block_index.to_bytes(8,'little') + counter.to_bytes(4,'little'))
-            stream.extend(hashlib.blake2s(material, digest_size=32).digest()); counter += 1
-        for j, value in enumerate(chunk): out[start+j] = value ^ stream[j]
-    return bytes(out)
+def _decrypt_stream(source, destination, password: str) -> None:
+    header = _read_exact(source, HEADER_STRUCT.size)
+    magic, version, salt, nonce_prefix, chunk_size = HEADER_STRUCT.unpack(header)
+    if magic != MAGIC or version != VERSION:
+        raise PJSFormatError("지원하지 않는 PJS 형식입니다. PJS4 파일인지 확인해 주세요.")
+    if chunk_size != CHUNK_SIZE:
+        raise PJSFormatError("지원하지 않는 PJS4 청크 크기입니다.")
+    key = _derive_key(password, salt)
+    aes = AESGCM(key)
+    index = 0
+    saw_final = False
+    while True:
+        record = source.read(RECORD_STRUCT.size)
+        if not record:
+            break
+        if len(record) != RECORD_STRUCT.size:
+            raise PJSFormatError("PJS 파일의 청크 헤더가 손상되었습니다.")
+        flag, cipher_len = RECORD_STRUCT.unpack(record)
+        if flag not in (0, 1) or cipher_len < TAG_SIZE or cipher_len > CHUNK_SIZE + TAG_SIZE:
+            raise PJSFormatError("PJS 파일의 청크 길이가 올바르지 않습니다.")
+        plain_len = cipher_len - TAG_SIZE
+        if flag == 0 and plain_len != CHUNK_SIZE:
+            raise PJSFormatError("PJS 파일의 중간 청크 길이가 올바르지 않습니다.")
+        if index >= 0xFFFFFFFF:
+            raise PJSFormatError("PJS 파일의 청크 수가 제한을 초과했습니다.")
+        ciphertext = _read_exact(source, cipher_len)
+        nonce = nonce_prefix + index.to_bytes(4, "big")
+        aad = header + index.to_bytes(8, "big") + bytes([flag]) + plain_len.to_bytes(4, "big")
+        try:
+            plaintext = aes.decrypt(nonce, ciphertext, aad)
+        except InvalidTag as exc:
+            raise PJSAuthenticationError("비밀번호가 틀렸거나 파일이 변조되었습니다.") from exc
+        destination.write(plaintext)
+        index += 1
+        if flag == 1:
+            saw_final = True
+            if source.read(1):
+                raise PJSFormatError("최종 청크 뒤에 불필요한 데이터가 있습니다.")
+            break
+    if not saw_final:
+        raise PJSFormatError("PJS 파일이 불완전합니다(최종 청크가 없습니다).")
 
+def compress_to_pjs(source_path: str | Path, output_path: str | Path, password: str) -> Path:
+    """Compress a file/folder into a password-protected PJS4 file."""
+    source = Path(source_path)
+    output = Path(output_path)
+    if len(password) < 12:
+        raise ValueError("비밀번호는 최소 12자 이상으로 설정해 주세요. 16자 이상의 고유한 문구를 권장합니다.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == output.resolve():
+        raise ValueError("입력 파일과 출력 파일이 같을 수 없습니다.")
+    zip_name = None
+    temp_output = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pjs4-", suffix=".zip", delete=False) as tmp:
+            zip_name = Path(tmp.name)
+        _make_zip(source, zip_name)
+        with tempfile.NamedTemporaryFile(prefix=".pjs4-", suffix=".tmp", dir=output.parent, delete=False) as tmp_out:
+            temp_output = Path(tmp_out.name)
+            with zip_name.open("rb") as zip_in:
+                _encrypt_stream(zip_in, tmp_out, password)
+            tmp_out.flush()
+            os.fsync(tmp_out.fileno())
+        os.replace(temp_output, output)
+        temp_output = None
+        return output
+    finally:
+        if zip_name:
+            zip_name.unlink(missing_ok=True)
+        if temp_output:
+            temp_output.unlink(missing_ok=True)
 
-def iter_entries(source: str | Path):
-    source = os.path.abspath(os.fspath(source))
-    if os.path.isfile(source):
-        yield os.path.basename(source), source, False; return
-    parent = os.path.dirname(source)
-    for current, dirs, files in os.walk(source):
-        dirs.sort(); rel_dir = os.path.relpath(current, parent).replace(os.sep, '/')
-        yield rel_dir.rstrip('/')+'/', current, True
-        for name in sorted(files):
-            full = os.path.join(current, name)
-            yield os.path.relpath(full, parent).replace(os.sep, '/'), full, False
+def _safe_member_path(root: Path, name: str) -> Path:
+    # ZIP member names must be treated as untrusted input.
+    normalized = name.replace("\\", "/")
+    pure = PurePosixPath(normalized)
+    if not normalized or normalized.startswith("/") or pure.is_absolute():
+        raise PJSFormatError("압축 파일에 절대 경로가 포함되어 있습니다.")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        raise PJSFormatError("압축 파일에 드라이브 경로가 포함되어 있습니다.")
+    if any(part in ("..", "") for part in normalized.split("/") if part != ""):
+        raise PJSFormatError("압축 파일에 안전하지 않은 경로가 포함되어 있습니다.")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    target = root.joinpath(*parts).resolve()
+    root_resolved = root.resolve()
+    try:
+        if os.path.commonpath([str(root_resolved), str(target)]) != str(root_resolved):
+            raise PJSFormatError("압축 해제 경로가 대상 폴더를 벗어납니다.")
+    except ValueError as exc:
+        raise PJSFormatError("압축 해제 경로가 올바르지 않습니다.") from exc
+    return target
 
+def _safe_extract(zip_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    total = 0
+    seen: set[str] = set()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        bad = zf.testzip()
+        if bad is not None:
+            raise PJSFormatError(f"내부 압축 데이터가 손상되었습니다: {bad}")
+        for info in zf.infolist():
+            target = _safe_member_path(root, info.filename)
+            key = target.as_posix().casefold()
+            if key in seen:
+                raise PJSFormatError("중복된 파일 경로가 포함되어 있어 해제를 중단했습니다.")
+            seen.add(key)
+            mode = (info.external_attr >> 16) & 0xFFFF
+            if stat.S_ISLNK(mode):
+                raise PJSFormatError("심볼릭 링크 항목은 해제할 수 없습니다.")
+            total += info.file_size
+            if total > MAX_ARCHIVE_TOTAL_SIZE:
+                raise PJSFormatError("압축 해제 대상의 총 크기가 허용 한도를 초과합니다.")
+            if info.is_dir() or info.filename.endswith(("/", "\\")):
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                raise FileExistsError(f"기존 파일을 덮어쓰지 않도록 중단했습니다: {target}")
+            with zf.open(info, "r") as src, target.open("xb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
 
-def safe_output_path(destination: str | Path, archive_name: str) -> str:
-    name = archive_name.replace('\\','/')
-    if name.startswith('/') or (len(name)>=2 and name[1]==':'):
-        raise ValueError('압축 파일에 절대 경로가 포함되어 있어 해제를 중단했습니다.')
-    parts = [p for p in name.split('/') if p not in ('', '.')]
-    if any(p == '..' for p in parts): raise ValueError('압축 파일에 상위 폴더 이동 경로가 포함되어 있습니다.')
-    dest = os.path.abspath(os.fspath(destination)); result = os.path.abspath(os.path.join(dest,*parts))
-    if os.path.commonpath([dest,result]) != dest: raise ValueError('안전하지 않은 출력 경로입니다.')
-    return result
-
-
-def _read_exact(stream, size: int) -> bytes:
-    data = stream.read(size)
-    if len(data) != size: raise ValueError('PJS 파일이 손상되었거나 중간에 잘렸습니다.')
-    return data
-
-
-# PJS3 uses zlib (implemented in native code) and a stored-file fallback.
-# Entry kinds: 0=zlib-compressed file, 1=directory, 2=stored file.
-# PJS1/PJS2 readers are retained below for backward compatibility.
-_COMPRESSED_EXTENSIONS = {
-    '.7z', '.aac', '.avi', '.avif', '.br', '.bz2', '.cab', '.flac', '.gif',
-    '.gz', '.heic', '.heif', '.jpeg', '.jpg', '.lz4', '.m4a', '.m4v', '.mkv',
-    '.mov', '.mp3', '.mp4', '.mpeg', '.mpg', '.pdf', '.png', '.rar', '.webm',
-    '.webp', '.xz', '.zip', '.zst', '.parquet', '.woff', '.woff2',
-    '.docx', '.xlsx', '.pptx', '.odt', '.ods', '.odp', '.apk', '.jar', '.epub', '.iso'
-}
-_CHUNK_SIZE = 1024 * 1024
-
-
-def _copy_file_and_crc(source: str, destination, progress=None, done_before=0, total_bytes=0):
-    raw_size = 0
-    crc = 0
-    with open(source, 'rb') as src:
-        while True:
-            chunk = src.read(_CHUNK_SIZE)
-            if not chunk:
-                break
-            destination.write(chunk)
-            raw_size += len(chunk)
-            crc = zlib.crc32(chunk, crc)
-            if progress and total_bytes:
-                progress(min(99, int((done_before + raw_size) * 100 / total_bytes)), done_before + raw_size, total_bytes)
-    return raw_size, crc & 0xffffffff
-
-
-def create_pjs(source: str | Path, output: str | Path, progress: Progress | None = None) -> None:
-    """Create a PJS3 archive quickly, preserving the ability to read PJS1/PJS2."""
-    entries = list(iter_entries(source))
-    output = os.fspath(output)
-    total_bytes = sum(os.path.getsize(full) for _, full, is_dir in entries if not is_dir)
-    total_bytes = max(total_bytes, 1)
-    processed = 0
-
-    with open(output, 'wb') as out:
-        out.write(PJS3_MAGIC)
-        out.write(struct.pack('<BI', PJS3_VERSION, len(entries)))
-        total_entries = max(len(entries), 1)
-
-        for index, (arcname, full, is_dir) in enumerate(entries, 1):
-            name = arcname.encode('utf-8')
-            if len(name) > 65535:
-                raise ValueError('경로가 너무 깁니다: ' + arcname)
-
-            if is_dir:
-                out.write(struct.pack('<BH', 1, len(name)))
-                out.write(name)
-                out.write(struct.pack('<QQI', 0, 0, 0))
-            else:
-                suffix = Path(full).suffix.lower()
-                # Already-compressed formats usually do not benefit from another
-                # compression pass. Store them directly to save CPU time.
-                if suffix in _COMPRESSED_EXTENSIONS:
-                    out.write(struct.pack('<BH', 2, len(name)))
-                    out.write(name)
-                    meta_pos = out.tell()
-                    out.write(struct.pack('<QQI', 0, 0, 0))
-                    data_start = out.tell()
-                    raw_size, crc = _copy_file_and_crc(full, out, progress, processed, total_bytes)
-                    packed_size = out.tell() - data_start
-                    end_pos = out.tell()
-                    out.seek(meta_pos)
-                    out.write(struct.pack('<QQI', raw_size, packed_size, crc))
-                    out.seek(end_pos)
-                else:
-                    # Compress to a disk-backed temporary stream first. If zlib
-                    # cannot reduce the size, store the original bytes instead.
-                    with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode='w+b') as temp:
-                        compressor = zlib.compressobj(level=6)
-                        raw_size = 0
-                        crc = 0
-                        with open(full, 'rb') as src:
-                            while True:
-                                chunk = src.read(_CHUNK_SIZE)
-                                if not chunk:
-                                    break
-                                raw_size += len(chunk)
-                                crc = zlib.crc32(chunk, crc)
-                                compressed = compressor.compress(chunk)
-                                if compressed:
-                                    temp.write(compressed)
-                                if progress and total_bytes:
-                                    progress(min(99, int((processed + raw_size) * 100 / total_bytes)), processed + raw_size, total_bytes)
-                        tail = compressor.flush()
-                        if tail:
-                            temp.write(tail)
-                        crc &= 0xffffffff
-                        packed_size = temp.tell()
-
-                        if packed_size < raw_size:
-                            kind = 0
-                            chosen_size = packed_size
-                        else:
-                            kind = 2
-                            chosen_size = raw_size
-
-                        out.write(struct.pack('<BH', kind, len(name)))
-                        out.write(name)
-                        out.write(struct.pack('<QQI', raw_size, chosen_size, crc))
-                        if kind == 0:
-                            temp.seek(0)
-                            shutil.copyfileobj(temp, out, length=_CHUNK_SIZE)
-                        else:
-                            with open(full, 'rb') as src:
-                                shutil.copyfileobj(src, out, length=_CHUNK_SIZE)
-
-                processed += os.path.getsize(full)
-
-            if progress:
-                if total_bytes > 1:
-                    progress(min(99, int(processed * 100 / total_bytes)), processed, total_bytes)
-                else:
-                    progress(int(index * 100 / total_entries), index, total_entries)
-
-        if progress:
-            progress(100, total_bytes, total_bytes)
-
-
-def extract_pjs(archive: str | Path, destination: str | Path, progress: Progress | None = None) -> None:
-    os.makedirs(destination, exist_ok=True)
-    archive = os.fspath(archive)
-    total_size = os.path.getsize(archive)
-    with open(archive, 'rb') as f:
-        magic = _read_exact(f, 4)
-        if magic not in (PJS_MAGIC, PJS_LEGACY_MAGIC, PJS3_MAGIC):
-            raise ValueError('올바른 PJS 파일이 아닙니다.')
-        version, count = struct.unpack('<BI', _read_exact(f, 5))
-        if magic == PJS_LEGACY_MAGIC and version != 1:
-            raise ValueError(f'지원하지 않는 PJS 버전입니다: {version}')
-        if magic == PJS_MAGIC and version != PJS_VERSION:
-            raise ValueError(f'지원하지 않는 PJS 버전입니다: {version}')
-        if magic == PJS3_MAGIC and version != PJS3_VERSION:
-            raise ValueError(f'지원하지 않는 PJS 버전입니다: {version}')
-        if count > 1_000_000:
-            raise ValueError('파일 항목 수가 비정상적으로 많습니다.')
-
-        total = max(count, 1)
-        for index in range(1, count + 1):
-            kind, name_len = struct.unpack('<BH', _read_exact(f, 3))
-            name = _read_exact(f, name_len).decode('utf-8')
-            raw_size, packed_size, expected_crc = struct.unpack('<QQI', _read_exact(f, 20))
-            out_path = safe_output_path(destination, name)
-
-            if kind == 1:
-                os.makedirs(out_path, exist_ok=True)
-                if packed_size:
-                    f.seek(packed_size, os.SEEK_CUR)
-            elif kind in (0, 2):
-                if magic != PJS3_MAGIC and kind != 0:
-                    raise ValueError('이전 PJS 형식에 잘못된 파일 항목 유형이 있습니다.')
-                if packed_size > total_size:
-                    raise ValueError('압축 데이터 크기가 비정상적입니다.')
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                crc = 0
-                written = 0
-                with open(out_path, 'wb') as dst:
-                    remaining = packed_size
-                    if magic == PJS3_MAGIC and kind == 0:
-                        decompressor = zlib.decompressobj()
-                        while remaining:
-                            chunk = _read_exact(f, min(_CHUNK_SIZE, remaining))
-                            remaining -= len(chunk)
-                            pending = chunk
-                            while pending:
-                                raw = decompressor.decompress(pending, _CHUNK_SIZE)
-                                pending = decompressor.unconsumed_tail
-                                if raw:
-                                    dst.write(raw)
-                                    written += len(raw)
-                                    crc = zlib.crc32(raw, crc)
-                                if not pending:
-                                    # Drain any buffered output without needing more input.
-                                    while True:
-                                        extra = decompressor.decompress(b'', _CHUNK_SIZE)
-                                        if not extra:
-                                            break
-                                        dst.write(extra)
-                                        written += len(extra)
-                                        crc = zlib.crc32(extra, crc)
-                        tail = decompressor.flush()
-                        if tail:
-                            dst.write(tail)
-                            written += len(tail)
-                            crc = zlib.crc32(tail, crc)
-                        if not decompressor.eof:
-                            raise ValueError(f'압축 데이터가 불완전합니다: {name}')
-                    elif magic == PJS3_MAGIC and kind == 2:
-                        while remaining:
-                            chunk = _read_exact(f, min(_CHUNK_SIZE, remaining))
-                            remaining -= len(chunk)
-                            dst.write(chunk)
-                            written += len(chunk)
-                            crc = zlib.crc32(chunk, crc)
-                    else:
-                        packed = _read_exact(f, packed_size)
-                        if magic == PJS_MAGIC:
-                            packed = transform_payload(packed, name)
-                        raw = pjs_decompress(packed, raw_size)
-                        dst.write(raw)
-                        written = len(raw)
-                        crc = zlib.crc32(raw, crc)
-
-                if written != raw_size:
-                    raise ValueError(f'원본 크기가 일치하지 않습니다: {name} (예상 {raw_size}, 복원 {written})')
-                if (crc & 0xffffffff) != expected_crc:
-                    raise ValueError(f'파일 검증에 실패했습니다: {name}')
-            else:
-                raise ValueError('알 수 없는 PJS 항목 유형입니다.')
-
-            if progress:
-                progress(int(index * 100 / total), index, total)
-
-def create_zip(source: str | Path, output: str | Path, progress: Progress | None = None) -> None:
-    """Create ZIP archives incrementally so large files report live progress."""
-    entries = list(iter_entries(source))
-    total_entries = max(len(entries), 1)
-    total_bytes = sum(os.path.getsize(full) for _, full, is_dir in entries if not is_dir)
-    processed = 0
-    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for index, (name, full, is_dir) in enumerate(entries, 1):
-            name = name.replace('\\', '/')
-            if is_dir:
-                zf.writestr(name if name.endswith('/') else name + '/', '')
-            else:
-                suffix = Path(full).suffix.lower()
-                info = zipfile.ZipInfo(name)
-                info.file_size = os.path.getsize(full)
-                info.compress_type = zipfile.ZIP_STORED if suffix in _COMPRESSED_EXTENSIONS else zipfile.ZIP_DEFLATED
-                with open(full, 'rb') as src, zf.open(info, 'w', force_zip64=True) as dst:
-                    while True:
-                        chunk = src.read(_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-                        processed += len(chunk)
-                        if progress and total_bytes:
-                            progress(min(99, int(processed * 100 / total_bytes)), processed, total_bytes)
-            if progress:
-                if total_bytes:
-                    progress(min(99, int(processed * 100 / total_bytes)), processed, total_bytes)
-                else:
-                    progress(int(index * 100 / total_entries), index, total_entries)
-    if progress:
-        if total_bytes:
-            progress(100, total_bytes, total_bytes)
-        else:
-            progress(100, total_entries, total_entries)
-
-def extract_zip(archive: str | Path, destination: str | Path, progress: Progress | None = None) -> None:
-    os.makedirs(destination,exist_ok=True)
-    with zipfile.ZipFile(archive,'r') as zf:
-        infos = zf.infolist(); total = max(len(infos),1); dest = os.path.abspath(os.fspath(destination))
-        for index,info in enumerate(infos,1):
-            out_path = safe_output_path(dest,info.filename)
-            if info.is_dir(): os.makedirs(out_path,exist_ok=True)
-            else:
-                os.makedirs(os.path.dirname(out_path),exist_ok=True)
-                with zf.open(info,'r') as src, open(out_path,'wb') as dst:
-                    while True:
-                        chunk = src.read(1024*1024)
-                        if not chunk: break
-                        dst.write(chunk)
-            if progress: progress(int(index*100/total),index,total)
+def decompress_pjs(pjs_path: str | Path, output_dir: str | Path, password: str) -> Path:
+    """Decrypt and safely extract a PJS4 file to output_dir."""
+    source = Path(pjs_path)
+    destination = Path(output_dir)
+    if not source.is_file():
+        raise FileNotFoundError(f"PJS 파일을 찾을 수 없습니다: {source}")
+    destination.mkdir(parents=True, exist_ok=True)
+    zip_name = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pjs4-decrypted-", suffix=".zip", delete=False) as tmp:
+            zip_name = Path(tmp.name)
+            with source.open("rb") as encrypted:
+                _decrypt_stream(encrypted, tmp, password)
+            tmp.flush()
+        _safe_extract(zip_name, destination)
+        return destination
+    finally:
+        if zip_name:
+            zip_name.unlink(missing_ok=True)
