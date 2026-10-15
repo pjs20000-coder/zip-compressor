@@ -19,6 +19,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
@@ -26,11 +28,15 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
-      - name: Build Diagnostic EXE (console enabled)
-        run: pyinstaller --noconfirm --clean --onefile --console --debug=all --collect-all tkinterdnd2 --name PJSCompressor main.py
+      - name: Syntax check
+        run: python -m py_compile main.py
 
-      - name: Upload EXE
+      - name: Build diagnostic EXE
+        run: pyinstaller --noconfirm --clean --onefile --console --debug=imports --collect-all tkinterdnd2 --name PJSCompressor main.py
+
+      - name: Upload diagnostic EXE
         uses: actions/upload-artifact@v4
         with:
           name: PJSCompressor-Windows-Diagnostic
           path: dist/PJSCompressor.exe
+          if-no-files-found: error
