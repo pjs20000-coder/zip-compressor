@@ -1,3 +1,4 @@
+
 name: Build Windows EXE
 
 on:
@@ -11,16 +12,15 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
@@ -35,7 +35,7 @@ jobs:
         run: pyinstaller --noconfirm --clean --onefile --console --debug=imports --collect-all tkinterdnd2 --name PJSCompressor main.py
 
       - name: Upload diagnostic EXE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: PJSCompressor-Windows-Diagnostic
           path: dist/PJSCompressor.exe
