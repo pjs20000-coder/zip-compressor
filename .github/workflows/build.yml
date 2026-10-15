@@ -26,11 +26,11 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
-      - name: Build GUI EXE (no console)
-        run: pyinstaller --noconfirm --clean --onefile --windowed --collect-all tkinterdnd2 --name PJSCompressor main.py
+      - name: Build Diagnostic EXE (console enabled)
+        run: pyinstaller --noconfirm --clean --onefile --console --debug=all --collect-all tkinterdnd2 --name PJSCompressor main.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: PJSCompressor-Windows
+          name: PJSCompressor-Windows-Diagnostic
           path: dist/PJSCompressor.exe
