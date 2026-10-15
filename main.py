@@ -552,42 +552,48 @@ class PJSCompressorApp:
 
 
 
+
 def main():
-    root = TkinterDnD.Tk()
-
-    app = PJSCompressorApp(root)
-
-    # 창의 위치와 표시 상태를 명시적으로 지정
-    root.geometry("700x470+100+100")
-    root.deiconify()
-    root.state("normal")
-    root.update_idletasks()
-    root.lift()
-
-    # 진단 로그
-    print("[DIAG] Tk 창 생성 완료")
-    print("[DIAG] 창 상태:", root.state())
-    print("[DIAG] 창 표시 가능 여부:", root.winfo_viewable())
-    print("[DIAG] 창 크기:", root.winfo_geometry())
-
-    # 2초 동안 창을 맨 앞으로 유지한 뒤 원래 상태로 복귀
-    root.attributes("-topmost", True)
-    root.after(2000, lambda: root.attributes("-topmost", False))
-
-    root.after(
-        1500,
-        lambda: print(
-            "[DIAG] 1.5초 후:",
-            "state =", root.state(),
-            "viewable =", root.winfo_viewable(),
-            "geometry =", root.winfo_geometry()
-        )
+    log_path = os.path.join(
+        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+        "PJSCompressor-diagnostic.log"
     )
 
-    root.mainloop()
+    def log(message):
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+            f.flush()
 
-if __name__ == "__main__":
-    main()
+    try:
+        log("\n========== 프로그램 시작 ==========")
+        log("Python 실행 진입")
+
+        root = TkinterDnD.Tk()
+        log("TkinterDnD.Tk() 성공")
+
+        app = PJSCompressorApp(root)
+        log("PJSCompressorApp(root) 성공")
+
+        root.geometry("700x470+100+100")
+        root.deiconify()
+        root.state("normal")
+        root.update_idletasks()
+        root.lift()
+
+        log("창 상태: " + str(root.state()))
+        log("창 표시 가능 여부: " + str(root.winfo_viewable()))
+        log("창 크기: " + str(root.winfo_geometry()))
+
+        root.attributes("-topmost", True)
+        root.after(2000, lambda: root.attributes("-topmost", False))
+
+        log("mainloop 진입 직전")
+        root.mainloop()
+        log("mainloop 종료")
+
+    except BaseException as exc:
+        import traceback
+        log("오류 발생:\n" + traceback.format_exc())
 
 
 if __name__ == "__main__":
