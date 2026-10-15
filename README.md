@@ -1,27 +1,31 @@
-# PJSCompressor — 재개발 진단판
+# PJSCompressor — Fresh Rebuild
 
-Windows용 ZIP/PJS 압축·압축 해제 GUI입니다. 기존 PJS1 읽기 호환성과 PJS2 생성 방식을 유지하는 것을 목표로 합니다.
+새로 구성한 PJS/ZIP 압축 관리 프로그램입니다. 기존 `tkinterdnd2` 외부 의존성을 제거하고 Python 표준 라이브러리만으로 GUI와 압축 처리를 구성했습니다.
 
-## 현재 변경 사항
-- 기존 PJS/ZIP 코덱 및 화면 기능을 유지했습니다.
-- 진단 로그 기록을 GUI 및 `tkinterdnd2` import 이전으로 이동했습니다.
-- `tkinterdnd2` 또는 네이티브 드래그 앤 드롭 초기화에 실패해도 기본 파일 선택 GUI를 시작하도록 대체 경로를 추가했습니다.
-- 치명적 시작 오류를 로그에 기록하고, 가능한 경우 오류 대화상자에도 표시합니다.
-- GitHub Actions는 콘솔이 활성화된 진단 EXE를 생성합니다.
+## 포함 기능
+- 파일 또는 폴더를 ZIP으로 압축
+- 파일 또는 폴더를 PJS2로 압축
+- ZIP/PJS 파일 압축 해제
+- 진행률 표시 및 오류 진단 로그
+- ZIP/PJS 압축 해제 경로 탐색 방지
+- 기존 PJS1 읽기 및 PJS2 형식 호환 로직 유지
 
-## 실행
-```powershell
-python -m pip install -r requirements.txt
+## 로컬 실행
+Python 3.10 이상 권장.
+
+```bash
 python main.py
+python -m unittest discover -s tests -v
 ```
 
-## 진단 로그
-Windows에서 다음 위치에 기록됩니다:
-`%LOCALAPPDATA%\PJSCompressor-diagnostic.log`
-
 ## GitHub Actions
-저장소의 `main` 브랜치에 올리거나 Actions에서 **Build Windows EXE**를 수동 실행한 뒤, `PJSCompressor-Windows-Diagnostic` artifact를 내려받으세요. 이 버전은 원인 확인용 콘솔이 포함되어 있습니다.
+프로젝트를 저장소 루트에 복사하고 `main` 브랜치에 push하거나 Actions에서 `Build PJSCompressor Windows`를 수동 실행하세요. 테스트 통과 후 두 아티팩트가 생성됩니다.
 
-## 주의
-- 현재 실행 환경은 Windows가 아니므로 실제 Windows GUI 표시, Tkinter/Tcl 배포, 드래그 앤 드롭 동작은 여기서 직접 검증할 수 없습니다.
-- PJS2의 파일명 기반 바이트 변환은 암호화가 아니라 난독화입니다. 민감한 데이터를 보호하는 용도로 사용하지 마세요.
+- `PJSCompressor-Diagnostic-Windows`: 콘솔이 있는 진단용 실행 파일
+- `PJSCompressor-GUI-Windows`: 콘솔 없는 GUI 실행 파일
+
+## 진단 로그
+Windows에서 `%LOCALAPPDATA%\PJSCompressor\diagnostic.log`에 기록합니다. 시작 직후 실패해도 GUI 초기화 이전 단계부터 로그 기록을 시도합니다.
+
+## 중요
+PJS 파일은 전용 형식이며 암호화가 아닙니다. 기존 프로젝트와 PJS 알고리즘을 호환되게 유지하려고 했지만, 실제 사용자 파일에 적용하기 전에는 복사본으로 검증하세요. 기존 PJS 샘플이 있다면 테스트 대상으로 추가해 호환성을 확인하는 것이 좋습니다.
